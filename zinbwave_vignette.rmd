@@ -1,0 +1,285 @@
+---
+title: "zinbwave_vignette"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(out.extra = '')
+```
+
+## ZINBWAVE vignette for single-cell sequencing data analysis
+
+This is an R Markdown document for a ZINBWAVE vignette adapted from:
+https://bioconductor.org/packages/release/bioc/vignettes/zinbwave/inst/doc/intro.html
+
+
+```{r,include=FALSE}
+
+# INSTALL scripts and libraries
+## try http:// if https:// URLs are not supported
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("zinbwave")
+
+# Load libraries
+library(zinbwave)
+library(scRNAseq)
+library(matrixStats)
+library(magrittr)
+library(ggplot2)
+library(biomaRt)
+
+# Register BiocParallel Serial Execution
+#BiocParallel::register(BiocParallel::SerialParam())
+
+```
+
+
+# Example dataset
+
+To illustrate the methodology, we will make use of the Fluidigm C1 dataset of (Pollen et al. 2014). The data consist of 65 cells, each sequenced at high and low depth. The data are publicly available as part of the scRNAseq package, in the form of a SummarizedExperiment object.
+
+```{r, include=FALSE}
+
+data("fluidigm")
+fluidigm
+
+table(colData(fluidigm)$Coverage_Type)
+
+
+```
+
+# Gene filtering
+
+First, we filter out the lowly expressed genes, by removing those genes that do not have at least 5 reads in at least 5 samples.
+
+
+```{r, include=FALSE}
+
+filter <- rowSums(assay(fluidigm)>5)>5
+table(filter)
+
+fluidigm <- fluidigm[filter,]
+
+
+```
+
+# We next identify the 100 most variable genes
+
+These will be the input of our ZINB-WaVE procedure. Although we apply ZINB-WaVE to only these genes primarily for computational reasons, it is generally a good idea to focus on a subset of highly-variable genes, in order to remove transcriptional noise and focus on the more biologically meaningful signals. However, at least 1,000 genes are probably needed for real analyses.
+
+```{r, include=FALSE}
+
+assay(fluidigm) %>% log1p %>% rowVars -> vars
+names(vars) <- rownames(fluidigm)
+vars <- sort(vars, decreasing = TRUE)
+head(vars)
+
+fluidigm <- fluidigm[names(vars)[1:100],]
+
+# Before proceeding, we rename the first assay of fluidigm “counts”
+# to avoid needing to specify which assay we should use for the zinbwave workflow. 
+# This is an optional step.
+
+assayNames(fluidigm)[1] <- "counts"
+
+
+```
+
+# ZINB-WaVE
+The easiest way to obtain the low-dimensional representation of the data with ZINB-WaVE is to use the zinbwave function. This function takes as input a SummarizedExperiment object and returns a SingleCellExperiment object.
+
+```{r, echo=FALSE}
+
+fluidigm_zinb <- zinbwave(fluidigm, K = 2, epsilon=1000)
+
+# By default, the zinbwave function fits a ZINB model with X=1n and V=1J. In this case, the model is a factor model akin to principal component analysis (PCA), where W is a factor matrix and αμ and απ are loading matrices. By default, the epsilon parameter is set to the number of genes. We empirically found that a high epsilon is often required to obtained a good low-level representation. See ?zinbModel for details. Here we set epsilon=1000.
+
+# The parameter K controls how many latent variables we want to infer from the data. W is stored in the reducedDim slot of the object. (See the SingleCellExperiment vignette for details).
+
+# In this case, as we specified K=2, we can visualize the resulting W matrix in a simple plot, color-coded by cell-type.
+
+W <- reducedDim(fluidigm_zinb)
+
+theme_set(theme_gray())
+
+data.frame(W, bio=colData(fluidigm)$Biological_Condition,
+           coverage=colData(fluidigm)$Coverage_Type) %>%
+    ggplot(aes(W1, W2, colour=bio, shape=coverage)) + geom_point() + 
+    scale_color_brewer(type = "qual", palette = "Set1") + theme_classic()
+
+```
+
+
+# Adding covariates
+
+The ZINB-WaVE model is more general than PCA, allowing the inclusion of additional sample and gene-level covariates that might help to infer the unknown factors.
+
+Sample-level covariates
+
+Typically, one could include batch information as sample-level covariate, to account for batch effects. Here, we illustrate this capability by including the coverage (high or low) as a sample-level covariate.
+
+The column Coverage_Type in the colData of fluidigm contains the coverage information. We can specify a design matrix that includes an intercept and an indicator variable for the coverage, by using the formula interface of zinbFit.
+
+
+```{r, echo=FALSE}
+
+str(fluidigm)
+
+fluidigm_cov <- zinbwave(fluidigm, K=2, X="~Coverage_Type", epsilon=1000)
+
+
+W <- reducedDim(fluidigm_cov)
+
+theme_set(theme_gray())
+
+data.frame(W, bio=colData(fluidigm)$Biological_Condition,
+           coverage=colData(fluidigm)$Coverage_Type) %>%
+    ggplot(aes(W1, W2, colour=bio, shape=coverage)) + geom_point() + 
+    scale_color_brewer(type = "qual", palette = "Set1") + theme_classic()
+
+```
+
+
+
+# t-SNE representation
+
+A t-SNE representation of the data can be obtained by computing the cell distances in the reduced space and running the t-SNE algorithm on the distance.
+
+```{r,echo=FALSE}
+
+library(Rtsne)
+
+W <- reducedDim(fluidigm_cov)
+tsne_data <- Rtsne(W, pca = FALSE, perplexity=10, max_iter=5000)
+
+data.frame(Dim1=tsne_data$Y[,1], Dim2=tsne_data$Y[,2], 
+           bio=colData(fluidigm)$Biological_Condition,
+           coverage=colData(fluidigm)$Coverage_Type) %>%
+    ggplot(aes(Dim1, Dim2, colour=bio, shape=coverage)) + geom_point() + 
+    scale_color_brewer(type = "qual", palette = "Set1") + theme_classic()
+
+```
+
+# Normalized values and deviance residuals
+
+Sometimes it is useful to have normalized values for visualization and residuals for model evaluation. Both quantities can be computed with the zinbwave() function.
+
+
+```{r, echo=FALSE}
+
+
+fluidigm_norm <- zinbwave(fluidigm, K=2, epsilon=1000, normalizedValues=TRUE,
+                    residuals = TRUE)
+
+#The fluidigm_norm object includes normalized values and residuals as additional assays.
+
+str(fluidigm_norm)
+
+```
+
+
+
+
+# The zinbFit function
+The zinbwave function is a user-friendly function to obtain the low-dimensional representation of the data, and optionally the normalized values and residuals from the model.
+
+However, it is sometimes useful to store all the parameter estimates and the value of the likelihood. The zinbFit function allows the user to create an object of class zinbModel that can be used to store all the parameter estimates and have greater control on the results.
+
+If a user has run zinbFit and wants to obtain normalized values or the low-dimensional representation of the data in a SingleCellExperiment format.
+
+```{r, include=FALSE}
+
+zinb <- zinbFit(fluidigm, K=2, epsilon=1000)
+
+#As with zinbwave, by default, the zinbFit function fits a ZINB model with X=1n and V=1J.
+
+#If a user has run zinbFit and wants to obtain normalized values or the low-dimensional representation of the data in a SingleCellExperiment format, 
+# they can pass the zinbModel object to zinbwave to avoid repeating all the computations.
+
+fluidigm_zinb <- zinbwave(fluidigm, fitted_model = zinb, K = 2, epsilon=1000)
+
+str(fluidigm_zinb)
+# this is a SingleCellExperiment object
+
+```
+
+
+
+# Using zinbwave with Seurat
+
+The factors inferred in the zinbwave model can be added as one of the low dimensional data representations in the Seurat object, for instance to find subpopulations using Seurat’s cluster analysis method.
+
+Note that the following workflow has only been tested with Seurat’s version 2.3.0.
+
+Here we create a simple Seurat object with the raw data.
+
+We run Seurat FindClusters on reduced dimension space from ZINBWAVE.
+
+NOTE: dims.use = 1:2, this should match K
+
+```{r, echo=FALSE}
+
+library(Seurat)
+
+seu <- CreateSeuratObject(raw.data = counts(fluidigm_zinb))
+
+
+# We can then add our zinbwave factors in the Seurat object.
+
+seu <- SetDimReduction(object = seu, reduction.type = "zinbwave", 
+                       slot = "cell.embeddings",
+                       new.data = reducedDim(fluidigm_zinb, "zinbwave"))
+seu <- SetDimReduction(object = seu, reduction.type = "zinbwave", slot = "key",
+                       new.data = "zinbwave")
+
+
+# Finally, we can use the zinbwave factors for cluster analysis.
+
+# NOTE: dims.use = 1:2, #this should match K
+
+# run Seurat FindClusters on reduced dimension space from ZINBWAVE
+seu <- FindClusters(object = seu, reduction.type = "zinbwave", 
+                    dims.use = 1:2, #this should match K
+                    resolution = 0.6, print.output = 0, save.SNN = TRUE)
+
+```
+
+
+
+
+# Differential Expression
+
+The zinbwave package can be used to compute observational weights to “unlock” bulk RNA-seq tools for single-cell applications, as illustrated in (Van den Berge et al. 2018).
+
+Since version 1.1.5, zinbwave computes the observational weights by default. See the man page of zinbwave. The weights are stored in an assay named weights and can be accessed with the following call.
+
+```{r, echo=FALSE}
+
+#weights <- assay(fluidigm_zinb, "weights")
+
+# Note that in this example, the value of the penalty parameter epsilon was set at 1000, although we do not recommend this for differential expression analysis in real applications. Our evaluations have shown that a value of epsilon=1e12 gives good performance across a range of datasets, although this number is still arbitrary. In general, values between 1e6 and 1e13 give best performances.
+
+```
+
+
+# Differential expression with DESeq2
+
+Analogously, we can use the weights in a DESeq2 analysis by using observation-level weights in the parameter estimation steps. In this case, there is no need to pass the weights to DESeq2 since they are already in the weights assay of the object.
+
+```{r, echo=FALSE}
+
+# library(DESeq2)
+# 
+# dds <- DESeqDataSet(fluidigm_zinb, design = ~ Biological_Condition)
+# 
+# dds <- DESeq(dds, sfType="poscounts", useT=TRUE, minmu=1e-6)
+# res <- lfcShrink(dds, contrast=c("Biological_Condition", "NPC", "GW16"),
+#                  type = "normal")
+# head(res)
+
+```
+
+
